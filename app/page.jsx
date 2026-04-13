@@ -5772,6 +5772,7 @@ export default function HomePage() {
         groups: JSON.parse(localStorage.getItem('groups') || '[]'),
         collapsedCodes: JSON.parse(localStorage.getItem('collapsedCodes') || '[]'),
         collapsedTrends: JSON.parse(localStorage.getItem('collapsedTrends') || '[]'),
+        collapsedEarnings: JSON.parse(localStorage.getItem('collapsedEarnings') || '[]'),
         refreshMs: parseInt(localStorage.getItem('refreshMs') || '30000', 10),
         viewMode: localStorage.getItem('viewMode') === 'list' ? 'list' : 'card',
         holdings: JSON.parse(localStorage.getItem('holdings') || '{}'),
@@ -5779,6 +5780,8 @@ export default function HomePage() {
         pendingTrades: JSON.parse(localStorage.getItem('pendingTrades') || '[]'),
         transactions: JSON.parse(localStorage.getItem('transactions') || '{}'),
         dcaPlans: JSON.parse(localStorage.getItem('dcaPlans') || '{}'),
+        customSettings: JSON.parse(localStorage.getItem('customSettings') || '{}'),
+        fundDailyEarnings: JSON.parse(localStorage.getItem('fundDailyEarnings') || '{}'),
         exportedAt: nowInTz().toISOString()
       };
       const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
@@ -5965,6 +5968,60 @@ export default function HomePage() {
           });
           setDcaPlans(mergedDca);
           storageHelper.setItem('dcaPlans', JSON.stringify(mergedDca));
+        }
+
+        if (isPlainObject(data.customSettings)) {
+          try {
+            const currentCustomSettings = JSON.parse(localStorage.getItem('customSettings') || '{}');
+            const mergedSettings = {
+              ...(isPlainObject(currentCustomSettings) ? currentCustomSettings : {}),
+              ...data.customSettings,
+            };
+            window.localStorage.setItem('customSettings', JSON.stringify(mergedSettings));
+            triggerCustomSettingsSync();
+            if (mergedSettings.localSortRules && Array.isArray(mergedSettings.localSortRules)) {
+              setSortRules(mergedSettings.localSortRules);
+            }
+            if (mergedSettings.localSortDisplayMode && SORT_DISPLAY_MODES.has(mergedSettings.localSortDisplayMode)) {
+              setSortDisplayMode(mergedSettings.localSortDisplayMode);
+            }
+            if (typeof mergedSettings.pcContainerWidth === 'number' && Number.isFinite(mergedSettings.pcContainerWidth)) {
+              setContainerWidth(Math.min(2000, Math.max(600, mergedSettings.pcContainerWidth)));
+            }
+            if (typeof mergedSettings.showMarketIndexPc === 'boolean') setShowMarketIndexPc(mergedSettings.showMarketIndexPc);
+            if (typeof mergedSettings.showMarketIndexMobile === 'boolean') setShowMarketIndexMobile(mergedSettings.showMarketIndexMobile);
+            if (typeof mergedSettings.showGroupFundSearchPc === 'boolean') setShowGroupFundSearchPc(mergedSettings.showGroupFundSearchPc);
+            if (typeof mergedSettings.showGroupFundSearchMobile === 'boolean') setShowGroupFundSearchMobile(mergedSettings.showGroupFundSearchMobile);
+          } catch { }
+        }
+
+        if (isPlainObject(data.fundDailyEarnings)) {
+          try {
+            const incomingScoped = normalizeFundDailyEarningsScoped(data.fundDailyEarnings);
+            const currentScoped = normalizeFundDailyEarningsScoped(
+              JSON.parse(localStorage.getItem('fundDailyEarnings') || '{}')
+            );
+            const mergedDaily = { ...currentScoped };
+            Object.entries(incomingScoped).forEach(([scope, bucket]) => {
+              if (!isPlainObject(bucket)) return;
+              const existingBucket = isPlainObject(mergedDaily[scope]) ? mergedDaily[scope] : {};
+              const mergedBucket = { ...existingBucket };
+              Object.entries(bucket).forEach(([code, list]) => {
+                if (!Array.isArray(list)) return;
+                const existingList = Array.isArray(mergedBucket[code]) ? mergedBucket[code] : [];
+                const existingByDate = new Map(existingList.map(item => [item.date, item]));
+                list.forEach(item => {
+                  if (!item || !item.date || !Number.isFinite(item.earnings)) return;
+                  existingByDate.set(item.date, item);
+                });
+                mergedBucket[code] = Array.from(existingByDate.values())
+                  .sort((a, b) => a.date.localeCompare(b.date));
+              });
+              mergedDaily[scope] = mergedBucket;
+            });
+            setFundDailyEarnings(mergedDaily);
+            storageHelper.setItem('fundDailyEarnings', JSON.stringify(mergedDaily));
+          } catch { }
         }
 
         // 导入成功后，仅刷新新追加的基金
