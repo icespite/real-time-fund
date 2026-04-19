@@ -4,6 +4,10 @@ set -e
 
 HTML_ROOT="/usr/share/nginx/html"
 
+# 同步文件夹：保证存在且可写（宿主机卷挂载时也尽量修正权限）
+mkdir -p /data/sync
+chown -R nginx:nginx /data/sync || true
+
 # 转义 sed 替换串中的特殊字符：\ & |
 escape_sed() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/&/\\&/g; s/|/\\|/g'
@@ -23,5 +27,8 @@ replace_var "__NEXT_PUBLIC_WEB3FORMS_ACCESS_KEY__" "${NEXT_PUBLIC_WEB3FORMS_ACCE
 replace_var "__NEXT_PUBLIC_GA_ID__" "${NEXT_PUBLIC_GA_ID}"
 replace_var "__NEXT_PUBLIC_GITHUB_LATEST_RELEASE_URL__" "${NEXT_PUBLIC_GITHUB_LATEST_RELEASE_URL}"
 replace_var "__NEXT_PUBLIC_IS_GITHUB_LOGIN__" "${NEXT_PUBLIC_IS_GITHUB_LOGIN}"
+replace_var "__NEXT_PUBLIC_STORAGE_DRIVER__" "${NEXT_PUBLIC_STORAGE_DRIVER}"
+replace_var "__NEXT_PUBLIC_STORAGE_SYNC_URL__" "${NEXT_PUBLIC_STORAGE_SYNC_URL}"
+replace_var "__NEXT_PUBLIC_STORAGE_POLL_MS__" "${NEXT_PUBLIC_STORAGE_POLL_MS}"
 
 exec nginx -g "daemon off;"

@@ -14,6 +14,30 @@ import { isNumber, isString, isPlainObject } from 'lodash';
 import { v4 as uuidv4 } from 'uuid';
 import { toast as sonnerToast } from 'sonner';
 import { Empty, EmptyHeader, EmptyTitle, EmptyDescription, EmptyMedia } from "@/components/ui/empty";
+
+// ====== Docker 服务器端本地存储（通过 Nginx /sync WebDAV 落盘） ======
+// 说明：为了“最小改动”保持应用内部仍使用 localStorage 作为运行时状态源，
+// 但在启用 server 模式时，会在启动时从服务器端文件回灌 localStorage，并在写入时把关键 key 持久化到服务器端。
+const NEXT_PUBLIC_STORAGE_DRIVER = (process.env.NEXT_PUBLIC_STORAGE_DRIVER || '').toLowerCase();
+const NEXT_PUBLIC_STORAGE_SYNC_URL = process.env.NEXT_PUBLIC_STORAGE_SYNC_URL || '/sync/storage.json';
+const NEXT_PUBLIC_STORAGE_POLL_MS = Number(process.env.NEXT_PUBLIC_STORAGE_POLL_MS || 0);
+const SERVER_STORAGE_KEYS = [
+  'funds',
+  'favorites',
+  'groups',
+  'collapsedCodes',
+  'collapsedTrends',
+  'collapsedEarnings',
+  'refreshMs',
+  'holdings',
+  'groupHoldings',
+  'pendingTrades',
+  'transactions',
+  'dcaPlans',
+  'customSettings',
+  'fundDailyEarnings',
+  'localUpdatedAt',
+];
 import {
   Select,
   SelectContent,
@@ -238,6 +262,216 @@ export default function HomePage() {
   const isLoggingOutRef = useRef(false);
   const isExplicitLoginRef = useRef(false);
 
+  const serverStorageEnabled = NEXT_PUBLIC_STORAGE_DRIVER === 'server';
+  const [serverStorageReady, setServerStorageReady] = useState(!serverStorageEnabled);
+  const serverStorageApplyingRef = useRef(false);
+  const serverStoragePersistTimerRef = useRef(null);
+  const serverStoragePollTimerRef = useRef(null);
+  const serverStorageLoggedErrorRef = useRef(false);
+  const serverStorageLoggedParseRef = useRef(false);
+  const serverStorageLastFlushedRef = useRef('');
+
+  const parseServerStorageBody = (text) => {
+    const raw = typeof text === 'string' ? text : '';
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    // 1) 标准 JSON
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === 'object') return parsed;
+    } catch {
+      // continue
+    }
+    // 2) 兼容旧/异常格式：每行 `key<whitespace>value`
+    // 例如：dcaPlans    '{"__global__":{}}'
+    const obj = {};
+    const lines = trimmed.split(/\r?\n/);
+    for (const line of lines) {
+      const l = String(line || '').trim();
+      if (!l) continue;
+      const m = l.match(/^([^\s]+)\s+([\s\S]+)$/);
+      if (!m) continue;
+      const key = m[1];
+      let value = (m[2] || '').trim();
+      // 去掉两侧引号
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      if (key) obj[key] = String(value);
+    }
+    return Object.keys(obj).length ? obj : null;
+  };
+
+  // server 存储：启动时从 /sync/storage.json 回灌，后续监听 localStorage 写入并落盘
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (!serverStorageEnabled) return;
+
+    let cancelled = false;
+
+    const keys = new Set(SERVER_STORAGE_KEYS);
+
+    const origSetItem = window.localStorage.setItem.bind(window.localStorage);
+    const origRemoveItem = window.localStorage.removeItem.bind(window.localStorage);
+    const origClear = window.localStorage.clear.bind(window.localStorage);
+
+    const snapshot = () => {
+      const obj = {};
+      keys.forEach((k) => {
+        const v = window.localStorage.getItem(k);
+        if (v !== null && v !== undefined) obj[k] = String(v);
+      });
+      return obj;
+    };
+
+    const persist = async () => {
+      try {
+        const snap = snapshot();
+        // 避免“空快照”覆盖已有服务端数据（例如首次启动/初始化阶段）
+        if (!snap || Object.keys(snap).length === 0) return;
+        const body = JSON.stringify(snap);
+        const res = await fetch(NEXT_PUBLIC_STORAGE_SYNC_URL, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store',
+          },
+          body,
+        });
+        if (!res.ok) {
+          throw new Error(`server storage PUT failed: ${res.status}`);
+        }
+      } catch (e) {
+        // 只提示一次，避免刷屏；不影响主流程
+        if (!serverStorageLoggedErrorRef.current) {
+          serverStorageLoggedErrorRef.current = true;
+          console.warn('[server-storage] 写入失败，跨浏览器同步将不可用：', e);
+        }
+      }
+    };
+
+    const schedulePersist = () => {
+      if (cancelled) return;
+      if (serverStoragePersistTimerRef.current) clearTimeout(serverStoragePersistTimerRef.current);
+      serverStoragePersistTimerRef.current = setTimeout(() => {
+        persist();
+      }, 600);
+    };
+
+    // monkey patch：捕获同一 tab 内对 localStorage 的写入
+    window.localStorage.setItem = (k, v) => {
+      origSetItem(k, v);
+      if (!serverStorageApplyingRef.current && keys.has(k)) schedulePersist();
+    };
+    window.localStorage.removeItem = (k) => {
+      origRemoveItem(k);
+      if (!serverStorageApplyingRef.current && keys.has(k)) schedulePersist();
+    };
+    window.localStorage.clear = () => {
+      origClear();
+      if (!serverStorageApplyingRef.current) schedulePersist();
+    };
+
+    const applyRemote = async () => {
+      try {
+        const res = await fetch(NEXT_PUBLIC_STORAGE_SYNC_URL, { cache: 'no-store' });
+        // 首次可能不存在文件：视为无远端数据，等待首次真实写入时自动创建
+        if (res.status === 404) return;
+        if (!res.ok) return;
+        const ct = (res.headers.get('content-type') || '').toLowerCase();
+        const text = await res.text();
+        const data = parseServerStorageBody(text);
+        if (!data) {
+          if (!serverStorageLoggedParseRef.current) {
+            serverStorageLoggedParseRef.current = true;
+            console.warn('[server-storage] 无法解析服务端存储内容，已忽略：', {
+              url: NEXT_PUBLIC_STORAGE_SYNC_URL,
+              status: res.status,
+              contentType: ct,
+              sample: String(text || '').slice(0, 60),
+            });
+          }
+          return;
+        }
+        if (!data || typeof data !== 'object') return;
+        serverStorageApplyingRef.current = true;
+        keys.forEach((k) => {
+          const v = data[k];
+          if (typeof v === 'string') {
+            origSetItem(k, v);
+          }
+        });
+      } catch {
+        // ignore
+      } finally {
+        serverStorageApplyingRef.current = false;
+      }
+    };
+
+    const startPoll = () => {
+      const intervalMs = Number.isFinite(NEXT_PUBLIC_STORAGE_POLL_MS) ? NEXT_PUBLIC_STORAGE_POLL_MS : 0;
+      if (!intervalMs || intervalMs < 1000) return;
+      if (serverStoragePollTimerRef.current) clearInterval(serverStoragePollTimerRef.current);
+      serverStoragePollTimerRef.current = setInterval(async () => {
+        if (cancelled) return;
+        try {
+          // 兜底落盘：即使某些写入路径没触发 monkey-patch，也会在轮询周期内把最新本地数据写到服务端
+          const localUpdatedAtNow = window.localStorage.getItem('localUpdatedAt') || '';
+          if (localUpdatedAtNow && localUpdatedAtNow !== serverStorageLastFlushedRef.current) {
+            serverStorageLastFlushedRef.current = localUpdatedAtNow;
+            persist();
+          }
+
+          const res = await fetch(NEXT_PUBLIC_STORAGE_SYNC_URL, { cache: 'no-store' });
+          if (!res.ok) return;
+          const ct = (res.headers.get('content-type') || '').toLowerCase();
+          const text = await res.text();
+          const data = parseServerStorageBody(text);
+          if (!data) {
+            if (!serverStorageLoggedParseRef.current) {
+              serverStorageLoggedParseRef.current = true;
+              console.warn('[server-storage] 轮询解析失败，已忽略：', {
+                url: NEXT_PUBLIC_STORAGE_SYNC_URL,
+                status: res.status,
+                contentType: ct,
+                sample: String(text || '').slice(0, 60),
+              });
+            }
+            return;
+          }
+          if (!data || typeof data !== 'object') return;
+          let remoteUpdatedAt = typeof data.localUpdatedAt === 'string' ? data.localUpdatedAt : '';
+          if ((remoteUpdatedAt.startsWith('"') && remoteUpdatedAt.endsWith('"')) || (remoteUpdatedAt.startsWith("'") && remoteUpdatedAt.endsWith("'"))) {
+            remoteUpdatedAt = remoteUpdatedAt.slice(1, -1);
+          }
+          const localUpdatedAt = window.localStorage.getItem('localUpdatedAt') || '';
+          if (remoteUpdatedAt && remoteUpdatedAt !== localUpdatedAt && remoteUpdatedAt > localUpdatedAt) {
+            // 远端更新：直接刷新页面以加载新数据（最小侵入式做法）
+            window.location.reload();
+          }
+        } catch {
+          // ignore
+        }
+      }, intervalMs);
+    };
+
+    (async () => {
+      await applyRemote();
+      if (!cancelled) setServerStorageReady(true);
+      startPoll();
+    })();
+
+    return () => {
+      cancelled = true;
+      // restore
+      window.localStorage.setItem = origSetItem;
+      window.localStorage.removeItem = origRemoveItem;
+      window.localStorage.clear = origClear;
+      if (serverStoragePersistTimerRef.current) clearTimeout(serverStoragePersistTimerRef.current);
+      if (serverStoragePollTimerRef.current) clearInterval(serverStoragePollTimerRef.current);
+    };
+  }, [serverStorageEnabled]);
+
   // 刷新频率状态
   const [refreshMs, setRefreshMs] = useState(60000);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -251,6 +485,7 @@ export default function HomePage() {
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
+    if (!serverStorageReady) return;
     try {
       const raw = window.localStorage.getItem('customSettings');
       if (!raw) return;
@@ -265,7 +500,7 @@ export default function HomePage() {
       if (typeof parsed?.showGroupFundSearchPc === 'boolean') setShowGroupFundSearchPc(parsed.showGroupFundSearchPc);
       if (typeof parsed?.showGroupFundSearchMobile === 'boolean') setShowGroupFundSearchMobile(parsed.showGroupFundSearchMobile);
     } catch { }
-  }, []);
+  }, [serverStorageReady]);
 
   // 全局刷新状态
   const [refreshing, setRefreshing] = useState(false);
@@ -313,6 +548,7 @@ export default function HomePage() {
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
+      if (!serverStorageReady) return;
       const savedSortBy = window.localStorage.getItem('localSortBy');
       const savedSortOrder = window.localStorage.getItem('localSortOrder');
       if (savedSortBy) setSortBy(savedSortBy);
@@ -391,7 +627,7 @@ export default function HomePage() {
 
       setIsSortLoaded(true);
     }
-  }, []);
+  }, [serverStorageReady]);
 
   useEffect(() => {
     if (typeof window !== 'undefined' && isSortLoaded) {
@@ -441,6 +677,7 @@ export default function HomePage() {
   useEffect(() => {
     // 优先使用服务端返回的时间，如果没有则使用本地存储的时间
     // 这里只设置初始值，后续更新由接口返回的时间驱动
+    if (!serverStorageReady) return;
     const stored = window.localStorage.getItem('localUpdatedAt');
     if (stored) {
       setLastSyncTime(stored);
@@ -448,7 +685,7 @@ export default function HomePage() {
       // 如果没有存储的时间，暂时设为 null，等待接口返回
       setLastSyncTime(null);
     }
-  }, []);
+  }, [serverStorageReady]);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [loginModalOpen, setLoginModalOpen] = useState(false);
   const [loginEmail, setLoginEmail] = useState('');
@@ -3394,6 +3631,7 @@ export default function HomePage() {
   };
 
   useEffect(() => {
+    if (!serverStorageReady) return;
     let cancelled = false;
     const init = async () => {
       try {
@@ -3510,7 +3748,7 @@ export default function HomePage() {
     };
     init();
     return () => { cancelled = true; };
-  }, [isSupabaseConfigured]);
+  }, [isSupabaseConfigured, serverStorageReady]);
 
   // 切换分组后，页面自动回到顶部（跳过首次初始化恢复）
   useEffect(() => {
