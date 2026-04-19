@@ -24,6 +24,7 @@ ENV NEXT_PUBLIC_STORAGE_SYNC_URL=$NEXT_PUBLIC_STORAGE_SYNC_URL
 ENV NEXT_PUBLIC_STORAGE_POLL_MS=$NEXT_PUBLIC_STORAGE_POLL_MS
 
 COPY package*.json ./
+RUN npm config set registry https://registry.npmmirror.com
 RUN npm ci --legacy-peer-deps
 
 COPY . .
