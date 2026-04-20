@@ -92,7 +92,7 @@ const COLUMN_HEADERS = {
   todayProfit: '当日收益',
   yesterdayProfit: '昨日收益',
   holdingProfit: '持有收益',
-  tags: '标签',
+  tags: '基金标签',
 };
 
 const SortableRowContext = createContext({
