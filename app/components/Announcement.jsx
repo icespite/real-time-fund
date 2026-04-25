@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-const ANNOUNCEMENT_KEY = 'hasClosedAnnouncement_v1.2.0';
+const ANNOUNCEMENT_KEY = 'hasClosedAnnouncement_v1.3.1';
 
 export default function Announcement() {
   const [isVisible, setIsVisible] = useState(false);
@@ -75,13 +75,12 @@ export default function Announcement() {
               <span>公告</span>
             </div>
             <div style={{ color: 'var(--text)', lineHeight: '1.6', fontSize: '15px', overflowY: 'auto', minHeight: 0, flex: 1, paddingRight: '4px' }}>
-              <p>v1.2.0 更新内容如下：</p>
-              <p>1. 🎉服务器已扩容，现已提升账号同步频率，支持更高频率的单账号多设备同步。</p>
-              <p>2. 重构日期选择组件。</p>
-              <p>3. 优化我的收益日期组件展示。</p>
-              <p>4. 修复清空持仓未清空定投问题。</p>
-              <p>5. 修复指数刷新问题。</p>
-              <p>6. 修复导入导出数据问题。</p>
+              <p>v1.3.1 更新内容如下：</p>
+              <p>1. 更换截图识别 ai 方案。</p>
+              <p>2. 修复分组新建、删除问题。</p>
+              <p>3. 修复移动端管理分组二次确认弹框层级问题。</p>
+              <p>4. 基金卡片、添加分组展示基金标签。</p>
+              <p>5. 定投弹框新增重置按钮。</p>
             </div>
 
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '8px' }}>
