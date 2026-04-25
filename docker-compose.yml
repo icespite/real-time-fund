@@ -1,5 +1,7 @@
 services:
   app:
+    # Host is linux/amd64; avoid pulling/running linux/arm64 images
+    platform: linux/amd64
     build:
       context: .
       args:
