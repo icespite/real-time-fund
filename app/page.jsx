@@ -24,6 +24,7 @@ const NEXT_PUBLIC_STORAGE_SYNC_URL = process.env.NEXT_PUBLIC_STORAGE_SYNC_URL ||
 const NEXT_PUBLIC_STORAGE_POLL_MS = Number(process.env.NEXT_PUBLIC_STORAGE_POLL_MS || 0);
 const SERVER_STORAGE_KEYS = [
   'funds',
+  'tags',
   'favorites',
   'groups',
   'collapsedCodes',
