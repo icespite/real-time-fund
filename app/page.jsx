@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState, useMemo, useLayoutEffect, useCallback } from 'react';
+import ScanButton from './components/ScanButton';
 import { motion, AnimatePresence } from 'framer-motion';
 import Image from 'next/image';
 import { createWorker } from 'tesseract.js';
@@ -10,7 +11,7 @@ import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 import timezone from 'dayjs/plugin/timezone';
 import isSameOrAfter from 'dayjs/plugin/isSameOrAfter';
-import { isNumber, isString, isPlainObject } from 'lodash';
+import { isNumber, isString, isPlainObject, isNil } from 'lodash';
 import { v4 as uuidv4 } from 'uuid';
 import { toast as sonnerToast } from 'sonner';
 import { Empty, EmptyHeader, EmptyTitle, EmptyDescription, EmptyMedia } from "@/components/ui/empty";
@@ -112,6 +113,8 @@ import { parseFundTextWithLLM, fetchFundData, fetchFundNetValueRange, fetchLates
 import packageJson from '../package.json';
 import PcFundTable from './components/PcFundTable';
 import MobileFundTable from './components/MobileFundTable';
+import FundTagsEditDialog from './components/FundTagsEditDialog';
+import { TAG_THEME_OPTIONS } from './components/AddTagDialog';
 import MobileBottomNav from './components/MobileBottomNav';
 import MineTab from './components/MineTab';
 import SearchFund from './components/SearchFund';
@@ -123,137 +126,61 @@ dayjs.extend(utc);
 dayjs.extend(timezone);
 dayjs.extend(isSameOrAfter);
 
-const DEFAULT_TZ = 'Asia/Shanghai';
-const getBrowserTimeZone = () => {
-  if (typeof Intl !== 'undefined' && Intl.DateTimeFormat) {
-    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    return tz || DEFAULT_TZ;
-  }
-  return DEFAULT_TZ;
-};
-const TZ = getBrowserTimeZone();
-dayjs.tz.setDefault(TZ);
-const nowInTz = () => dayjs().tz(TZ);
-const toTz = (input) => (input ? dayjs.tz(input, TZ) : nowInTz());
-const formatDate = (input) => toTz(input).format('YYYY-MM-DD');
+import {
+  getBrowserTimeZone,
+  TZ,
+  nowInTz,
+  toTz,
+  formatDate,
+  DCA_SCOPE_GLOBAL,
+  SUMMARY_TAB_ID,
+  SUMMARY_SOURCE_GLOBAL,
+  hasOwn,
+  DEFAULT_FUND_TAG_THEME,
+  normalizeFundTagTheme,
+  normalizeFundTagInstanceListFromInput,
+  stripLegacyTagsFromFundObject,
+  getFundCodesFromTagRecord,
+  sanitizeTagRowForStorage,
+  serializeTagRecordsForCompare,
+  mergeTagRowsByName,
+  mergeLegacyInlineTagsIntoRecords,
+  cloneHoldingDeep,
+  normalizeHoldingEntryForSeed,
+  seedGroupHoldingsFromGlobal,
+  migrateDcaPlansToScoped
+} from './lib/fundHelpers';
 
-/** 定投计划分桶：全局与其它自定义分组 */
-const DCA_SCOPE_GLOBAL = '__global__';
-/** 虚拟 Tab：多分组有持仓时的汇总视图（非真实分组 id） */
-const SUMMARY_TAB_ID = '__portfolio_groups_summary__';
-/** 汇总合并持仓映射中：表示该笔展示来自「全部」全局持仓（非真实分组 id） */
-const SUMMARY_SOURCE_GLOBAL = '__portfolio_summary_global__';
-const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
-
-function cloneHoldingDeep(src) {
-  if (!isPlainObject(src)) return null;
-  try {
-    return typeof structuredClone === 'function' ? structuredClone(src) : JSON.parse(JSON.stringify(src));
-  } catch {
-    return { ...src };
-  }
-}
-
-/** 规范化单条持仓（与 collectLocalPayload 清洗逻辑对齐） */
-function normalizeHoldingEntryForSeed(value) {
-  if (!isPlainObject(value)) return null;
-  const parsedShare = isNumber(value.share)
-    ? value.share
-    : isString(value.share)
-      ? Number(value.share)
-      : NaN;
-  const parsedCost = isNumber(value.cost)
-    ? value.cost
-    : isString(value.cost)
-      ? Number(value.cost)
-      : NaN;
-  const nextShare = Number.isFinite(parsedShare) ? parsedShare : null;
-  const nextCost = Number.isFinite(parsedCost) ? parsedCost : null;
-  if (nextShare === null && nextCost === null) return null;
-  return { ...value, share: nextShare, cost: nextCost };
-}
-
-/**
- * 幂等：按分组用全局持仓填空槽；剔除已删除分组的 key；多分组各得深拷贝。
- */
-function seedGroupHoldingsFromGlobal(globalHoldings, groups, prevGroupHoldings) {
-  const prev = isPlainObject(prevGroupHoldings) ? prevGroupHoldings : {};
-  const groupIdSet = new Set(groups.map((g) => g?.id).filter(Boolean));
-  const next = {};
-  for (const id of groupIdSet) {
-    next[id] = { ...(isPlainObject(prev[id]) ? prev[id] : {}) };
-  }
-  let changed = Object.keys(prev).some((id) => !groupIdSet.has(id));
-  if (!changed && Object.keys(next).length !== Object.keys(prev).filter((id) => groupIdSet.has(id)).length) {
-    changed = true;
-  }
-  if (isPlainObject(globalHoldings)) {
-    for (const g of groups) {
-      if (!g?.id || !groupIdSet.has(g.id)) continue;
-      const bucket = next[g.id];
-      for (const code of g.codes || []) {
-        if (!code || bucket[code] !== undefined) continue;
-        const norm = normalizeHoldingEntryForSeed(globalHoldings[code]);
-        if (!norm) continue;
-        const cloned = cloneHoldingDeep(norm);
-        if (cloned) {
-          bucket[code] = cloned;
-          changed = true;
-        }
-      }
-    }
-  }
-  if (!changed) {
-    const prevKeys = Object.keys(prev).sort();
-    const nextKeys = Object.keys(next).sort();
-    if (prevKeys.join(',') !== nextKeys.join(',')) changed = true;
-    else {
-      for (const id of nextKeys) {
-        if (JSON.stringify(next[id]) !== JSON.stringify(prev[id])) {
-          changed = true;
-          break;
-        }
-      }
-    }
-  }
-  return { next, changed };
-}
-
-/** 旧版扁平 dcaPlans（code -> plan）→ { __global__: { ... } } */
-function migrateDcaPlansToScoped(raw) {
-  if (!isPlainObject(raw)) return { [DCA_SCOPE_GLOBAL]: {} };
-  if (raw[DCA_SCOPE_GLOBAL] !== undefined && isPlainObject(raw[DCA_SCOPE_GLOBAL])) {
-    return raw;
-  }
-  return { [DCA_SCOPE_GLOBAL]: { ...raw } };
-}
-
-function ScanButton({ onClick, disabled }) {
-  return (
-    <button
-      type="button"
-      className="icon-button"
-      onClick={onClick}
-      disabled={disabled}
-      title="拍照/上传图片识别基金代码"
-      style={{
-        opacity: disabled ? 0.5 : 1,
-        cursor: disabled ? 'wait' : 'pointer',
-        width: '32px',
-        height: '32px'
-      }}
-    >
-      {disabled ? (
-        <div className="loading-spinner" style={{ width: 16, height: 16, border: '2px solid var(--muted)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
-      ) : (
-        <CameraIcon width="18" height="18" />
-      )}
-    </button>
-  );
-}
+import GlobalToast from './components/GlobalToast';
 
 export default function HomePage() {
   const [funds, setFunds] = useState([]);
+  /** 基金标签（独立 localStorage 键 `tags`）：{ id, name, theme, fundCodes: string[] }[] */
+  const [fundTagRecords, setFundTagRecords] = useState([]);
+  /**
+   * 每只基金已选标签实例：仅由 `tags` 推导生成（不再持久化 fundTagLists）。
+   * 形状保持为 { [code]: {id,name,theme}[] }，便于复用现有组件接口。
+   */
+  const fundTagListsByCode = useMemo(() => {
+    const out = {};
+    const codeSet = new Set((funds || []).map((f) => String(f?.code ?? '').trim()).filter(Boolean));
+    for (const r of fundTagRecords || []) {
+      if (!r || typeof r !== 'object') continue;
+      const id = String(r.id ?? '').trim();
+      const name = String(r.name ?? '').trim();
+      if (!id || !name) continue;
+      const theme = normalizeFundTagTheme(r.theme);
+      for (const c of getFundCodesFromTagRecord(r)) {
+        if (!codeSet.has(c)) continue;
+        if (!out[c]) out[c] = [];
+        out[c].push({ id, name, theme });
+      }
+    }
+    Object.keys(out).forEach((c) => {
+      out[c] = out[c].filter((x) => x?.name).sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
+    });
+    return out;
+  }, [fundTagRecords, funds]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const timerRef = useRef(null);
@@ -673,6 +600,7 @@ export default function HomePage() {
   // 用户认证状态（Supabase 会话仍由客户端持久化；用户信息由 zustand 全局管理）
   const user = useUserStore((s) => s.user);
   const [lastSyncTime, setLastSyncTime] = useState(null);
+  const deviceIdRef = useRef('');
 
   useEffect(() => {
     // 优先使用服务端返回的时间，如果没有则使用本地存储的时间
@@ -686,6 +614,20 @@ export default function HomePage() {
       setLastSyncTime(null);
     }
   }, [serverStorageReady]);
+
+  useEffect(() => {
+    try {
+      const key = 'rtfDeviceId';
+      let id = window.localStorage.getItem(key);
+      if (!id) {
+        id = uuidv4();
+        window.localStorage.setItem(key, id);
+      }
+      deviceIdRef.current = id;
+    } catch {
+      deviceIdRef.current = uuidv4();
+    }
+  }, []);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [loginModalOpen, setLoginModalOpen] = useState(false);
   const [loginEmail, setLoginEmail] = useState('');
@@ -846,6 +788,12 @@ export default function HomePage() {
   const [portfolioEarningsOpen, setPortfolioEarningsOpen] = useState(false);
   const [mobileFundDrawerOpen, setMobileFundDrawerOpen] = useState(false);
   const [mobileTableSettingModalOpen, setMobileTableSettingModalOpen] = useState(false);
+  const [fundTagsEdit, setFundTagsEdit] = useState({
+    open: false,
+    code: null,
+    name: '',
+    tags: [],
+  });
 
   useEffect(() => {
     if (!isMobile) {
@@ -1741,6 +1689,18 @@ export default function HomePage() {
           holding && isNumber(holding.cost) && isNumber(holding.share)
             ? holding.cost * holding.share
             : 0;
+        const holdingCostValue =
+          holding && isNumber(holding.cost) && isNumber(holding.share)
+            ? holding.cost * holding.share
+            : null;
+        const holdingCost =
+          holdingCostValue == null
+            ? '-'
+            : Number(holdingCostValue).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const costNavValue =
+          holding && isNumber(holding.cost) ? holding.cost : null;
+        const costNav =
+          costNavValue == null ? '—' : Number(costNavValue).toFixed(4);
         const todayProfitPercent =
           profitToday != null && principal > 0
             ? `${profitToday > 0 ? '+' : profitToday < 0 ? '-' : ''}${Math.abs((profitToday / principal) * 100).toFixed(2)}%`
@@ -1809,10 +1769,20 @@ export default function HomePage() {
             ? ''
             : `${estimateProfitPercentValue > 0 ? '+' : ''}${estimateProfitPercentValue.toFixed(2)}%`;
 
+        const fc = String(f.code ?? '').trim();
+        const listFromDerived = fundTagListsByCode[fc];
+        const fundTags = Array.isArray(listFromDerived)
+          ? listFromDerived.map(({ name, theme }) => ({
+              name: String(name ?? '').trim(),
+              theme: normalizeFundTagTheme(theme),
+            }))
+          : [];
+
         return {
           rawFund: f,
           code: f.code,
           fundName: f.name,
+          fundTags,
           isHoldingLinked: !!isHoldingLinked,
           isUpdated: f.jzrq === todayStr,
           hasDca: dcaPlansForTab[f.code]?.enabled === true,
@@ -1834,6 +1804,10 @@ export default function HomePage() {
           estimateProfitPercent,
           holdingAmount,
           holdingAmountValue,
+          holdingCost,
+          holdingCostValue,
+          costNav,
+          costNavValue,
           holdingDaysValue,
           todayProfit,
           todayProfitPercent,
@@ -1860,6 +1834,8 @@ export default function HomePage() {
       currentTab,
       summaryHoldingSourceGroupByCode,
       linkedHoldingsForAllFav,
+      fundTagRecords,
+      fundTagListsByCode,
     ],
   );
 
@@ -2859,10 +2835,27 @@ export default function HomePage() {
       ]));
       const items = list.map((item) => {
         if (!item?.code) return null;
-        const extras = fields.map((field) => item?.[field] || '').join(':');
+        const extras = fields.map((field) => item?.[field] ?? '').join(':');
         return `${item.code}:${extras}`;
       }).filter(Boolean);
       return Array.from(new Set(items)).join('|');
+    } catch (e) {
+      return '';
+    }
+  }, []);
+
+  /** 独立 `tags` 存储变更检测（与 funds 分离） */
+  const getTagsStoreSignature = useCallback((value) => {
+    try {
+      const list = Array.isArray(value) ? value : JSON.parse(value || '[]');
+      if (!Array.isArray(list)) return '';
+      return list
+        .map((r) => {
+          const codes = getFundCodesFromTagRecord(r).sort().join(',');
+          return `${codes}\u001e${String(r?.id ?? '').trim()}\u001e${String(r?.name ?? '').trim()}\u001e${String(r?.theme ?? '').trim()}`;
+        })
+        .sort()
+        .join('|');
     } catch (e) {
       return '';
     }
@@ -2904,7 +2897,7 @@ export default function HomePage() {
 
   const storageHelper = useMemo(() => {
     // 仅以下 key 参与云端同步；fundValuationTimeseries 不同步到云端（测试中功能，暂不同步）
-    const keys = new Set(['funds', 'favorites', 'groups', 'collapsedCodes', 'collapsedTrends', 'collapsedEarnings', 'refreshMs', 'holdings', 'groupHoldings', 'pendingTrades', 'transactions', 'dcaPlans', 'customSettings', 'fundDailyEarnings']);
+    const keys = new Set(['funds', 'tags', 'favorites', 'groups', 'collapsedCodes', 'collapsedTrends', 'collapsedEarnings', 'refreshMs', 'holdings', 'groupHoldings', 'pendingTrades', 'transactions', 'dcaPlans', 'customSettings', 'fundDailyEarnings']);
     const triggerSync = (key, prevValue, nextValue) => {
       if (keys.has(key)) {
         // 标记为脏数据
@@ -2913,6 +2906,13 @@ export default function HomePage() {
         if (key === 'funds') {
           const prevSig = getFundCodesSignature(prevValue);
           const nextSig = getFundCodesSignature(nextValue);
+          if (prevSig === nextSig) {
+            return;
+          }
+        }
+        if (key === 'tags') {
+          const prevSig = getTagsStoreSignature(prevValue);
+          const nextSig = getTagsStoreSignature(nextValue);
           if (prevSig === nextSig) {
             return;
           }
@@ -2927,7 +2927,7 @@ export default function HomePage() {
     };
     return {
       setItem: (key, value) => {
-        const prevValue = key === 'funds' ? window.localStorage.getItem(key) : null;
+        const prevValue = key === 'funds' || key === 'tags' ? window.localStorage.getItem(key) : null;
         window.localStorage.setItem(key, value);
         if (key === 'localUpdatedAt') {
           setLastSyncTime(value);
@@ -2935,7 +2935,7 @@ export default function HomePage() {
         triggerSync(key, prevValue, value);
       },
       removeItem: (key) => {
-        const prevValue = key === 'funds' ? window.localStorage.getItem(key) : null;
+        const prevValue = key === 'funds' || key === 'tags' ? window.localStorage.getItem(key) : null;
         window.localStorage.removeItem(key);
         triggerSync(key, prevValue, null);
       },
@@ -2949,11 +2949,11 @@ export default function HomePage() {
         scheduleSync();
       }
     };
-  }, [getFundCodesSignature, scheduleSync]);
+  }, [getFundCodesSignature, getTagsStoreSignature, scheduleSync]);
 
   useEffect(() => {
     // 仅以下 key 的变更会触发云端同步；fundValuationTimeseries 不在其中
-    const keys = new Set(['funds', 'favorites', 'groups', 'collapsedCodes', 'collapsedTrends', 'collapsedEarnings', 'refreshMs', 'holdings', 'groupHoldings', 'pendingTrades', 'dcaPlans', 'customSettings', 'fundDailyEarnings']);
+    const keys = new Set(['funds', 'tags', 'favorites', 'groups', 'collapsedCodes', 'collapsedTrends', 'collapsedEarnings', 'refreshMs', 'holdings', 'groupHoldings', 'pendingTrades', 'dcaPlans', 'customSettings', 'fundDailyEarnings']);
     const onStorage = (e) => {
       if (!e.key) return;
       if (e.key === 'localUpdatedAt') {
@@ -2965,6 +2965,11 @@ export default function HomePage() {
         const nextSig = getFundCodesSignature(e.newValue);
         if (prevSig === nextSig) return;
       }
+      if (e.key === 'tags') {
+        const prevSig = getTagsStoreSignature(e.oldValue);
+        const nextSig = getTagsStoreSignature(e.newValue);
+        if (prevSig === nextSig) return;
+      }
       scheduleSync();
     };
     window.addEventListener('storage', onStorage);
@@ -2972,7 +2977,7 @@ export default function HomePage() {
       window.removeEventListener('storage', onStorage);
       if (syncDebounceRef.current) clearTimeout(syncDebounceRef.current);
     };
-  }, [getFundCodesSignature, scheduleSync]);
+  }, [getFundCodesSignature, getTagsStoreSignature, scheduleSync]);
 
   const triggerCustomSettingsSync = useCallback(() => {
     queueMicrotask(() => {
@@ -2985,6 +2990,158 @@ export default function HomePage() {
       scheduleSync();
     });
   }, [scheduleSync]);
+
+  const openFundTagsEdit = useCallback((row) => {
+    if (!row?.code) return;
+    const raw = row.rawFund;
+    const fc = String(row.code).trim();
+    const tags = (fundTagRecords || [])
+      .filter((r) => getFundCodesFromTagRecord(r).includes(fc))
+      .map((r) => ({
+        id: String(r.id ?? '').trim() || uuidv4(),
+        name: String(r.name ?? '').trim(),
+        theme: String(r.theme ?? '').trim() || DEFAULT_FUND_TAG_THEME,
+      }))
+      .filter((x) => x.name)
+      .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
+    setFundTagsEdit({
+      open: true,
+      code: row.code,
+      name: row.fundName || raw?.name || '',
+      tags,
+    });
+  }, [fundTagRecords]);
+
+  const handleSaveFundTags = useCallback(
+    (code, tagRows) => {
+      if (!code) return;
+      const fc = String(code).trim();
+      const rows = Array.isArray(tagRows) ? tagRows : [];
+      const normalized = normalizeFundTagInstanceListFromInput(rows);
+
+      setFundTagRecords((prev) => {
+        const selectedById = new Map(
+          normalized.map((x) => [String(x.id).trim(), x]).filter(([id]) => id),
+        );
+
+        const byId = new Map();
+        for (const r of prev) {
+          const id = String(r?.id ?? '').trim();
+          if (!id) continue;
+          byId.set(id, r);
+        }
+
+        for (const [id, row] of [...byId.entries()]) {
+          const nm = String(row.name ?? '').trim();
+          if (!nm) {
+            byId.delete(id);
+            continue;
+          }
+          const meta = selectedById.get(id);
+          if (meta) {
+            let codes = getFundCodesFromTagRecord(row);
+            if (!codes.includes(fc)) codes = [...codes, fc].sort();
+            const nextRow = sanitizeTagRowForStorage({
+              ...row,
+              id,
+              name: meta.name,
+              theme: meta.theme,
+              fundCodes: codes,
+            });
+            if (nextRow) byId.set(id, nextRow);
+          } else {
+            const codes = getFundCodesFromTagRecord(row).filter((c) => c !== fc);
+            const nextRow = sanitizeTagRowForStorage({
+              ...row,
+              fundCodes: codes,
+            });
+            if (nextRow) byId.set(id, nextRow);
+          }
+        }
+
+        for (const [id, meta] of selectedById) {
+          if (byId.has(id)) continue;
+          const row = sanitizeTagRowForStorage({
+            id,
+            name: meta.name,
+            theme: meta.theme,
+            fundCodes: [fc],
+          });
+          if (row) byId.set(id, row);
+        }
+
+        const next = Array.from(byId.values())
+          .map(sanitizeTagRowForStorage)
+          .filter(Boolean)
+          .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+        storageHelper.setItem('tags', JSON.stringify(next));
+        return next;
+      });
+    },
+    [storageHelper],
+  );
+
+  /** 仅写入可选池：每次新增一条独立记录（允许可选池内重名），不改变已有 fundCodes */
+  const handleAddPoolTag = useCallback(
+    (payload) => {
+      const th = String(payload?.theme ?? '').trim() || DEFAULT_FUND_TAG_THEME;
+      const rawNames =
+        Array.isArray(payload?.names) && payload.names.length
+          ? payload.names
+          : payload?.name != null && String(payload.name).trim()
+            ? [String(payload.name).trim()]
+            : [];
+      if (!rawNames.length) return;
+
+      setFundTagRecords((prev) => {
+        const next = [...prev];
+        for (const nm of rawNames) {
+          const name = String(nm ?? '').trim();
+          if (!name) continue;
+          const row = sanitizeTagRowForStorage({
+            id: uuidv4(),
+            name,
+            theme: th,
+            fundCodes: [],
+          });
+          if (row) next.push(row);
+        }
+        storageHelper.setItem('tags', JSON.stringify(next));
+        return next;
+      });
+    },
+    [storageHelper],
+  );
+
+  /** 从全局 tags 存储中按 id 移除该条标签记录，并清理各基金已选列表中的同 id 引用 */
+  const handleDeleteGlobalTag = useCallback(
+    (tagId) => {
+      const id = String(tagId ?? '').trim();
+      if (!id) return;
+      setFundTagRecords((prev) => {
+        const next = prev.filter((r) => String(r.id).trim() !== id);
+        storageHelper.setItem('tags', JSON.stringify(next));
+        return next;
+      });
+    },
+    [storageHelper],
+  );
+
+  /** 删除前展示：该标签关联的基金文案列表（按标签 id） */
+  const getTagUsageLabels = useCallback(
+    (tagId) => {
+      const id = String(tagId ?? '').trim();
+      const row = fundTagRecords.find((r) => String(r.id).trim() === id);
+      if (!row) return [];
+      const codes = getFundCodesFromTagRecord(row);
+      return codes.map((c) => {
+        const f = funds.find((x) => String(x.code) === String(c));
+        const namePart = f?.name ? String(f.name) : '';
+        return namePart ? `${namePart}（${c}）` : String(c);
+      });
+    },
+    [fundTagRecords, funds],
+  );
 
   const applyViewMode = useCallback((mode) => {
     if (mode !== 'card' && mode !== 'list') return;
@@ -3098,8 +3255,7 @@ export default function HomePage() {
 
         const last = plan.lastDate ? toTz(plan.lastDate).startOf('day') : null;
 
-        let anchor = last ? last : first.clone().subtract(1, 'day');
-        let current = anchor;
+        let current = last ? last.clone() : first.clone();
         let lastGenerated = null;
 
         const stepOnce = () => {
@@ -3110,33 +3266,36 @@ export default function HomePage() {
           return current.add(1, 'day');
         };
 
-        while (true) {
+        if (last) {
           current = stepOnce();
+        }
+
+        while (true) {
           if (current.isAfter(today, 'day')) break;
-          if (current.isBefore(first, 'day')) continue;
 
-          if (!isDateTradingDay(current)) continue;
+          if (!current.isBefore(first, 'day') && isDateTradingDay(current)) {
+            const dateStr = current.format('YYYY-MM-DD');
 
-          const dateStr = current.format('YYYY-MM-DD');
-
-          const pending = {
-            id: `dca_${scopeKey}_${code}_${dateStr}_${Date.now()}`,
-            fundCode: code,
-            fundName: (funds.find(f => f.code === code) || {}).name,
-            type: 'buy',
-            share: null,
-            amount,
-            feeRate,
-            feeMode: undefined,
-            feeValue: undefined,
-            date: dateStr,
-            isAfter3pm: false,
-            isDca: true,
-            timestamp: Date.now(),
-            ...(tradeGid ? { groupId: tradeGid } : {}),
-          };
-          newPending.push(pending);
-          lastGenerated = current;
+            const pending = {
+              id: `dca_${scopeKey}_${code}_${dateStr}_${Date.now()}`,
+              fundCode: code,
+              fundName: (funds.find(f => f.code === code) || {}).name,
+              type: 'buy',
+              share: null,
+              amount,
+              feeRate,
+              feeMode: undefined,
+              feeValue: undefined,
+              date: dateStr,
+              isAfter3pm: false,
+              isDca: true,
+              timestamp: Date.now(),
+              ...(tradeGid ? { groupId: tradeGid } : {}),
+            };
+            newPending.push(pending);
+            lastGenerated = current;
+          }
+          current = stepOnce();
         }
 
         if (lastGenerated) {
@@ -3289,6 +3448,35 @@ export default function HomePage() {
           }
         }
       } catch { }
+      setTransactions((prev) => {
+        const out = { ...(prev || {}) };
+        let changed = false;
+        Object.keys(out).forEach((code) => {
+          const list = out[code];
+          if (!Array.isArray(list) || list.length === 0) return;
+          const filtered = list.filter((t) => !removedIds.includes(t?.groupId));
+          if (filtered.length !== list.length) {
+            changed = true;
+            if (filtered.length) out[code] = filtered;
+            else delete out[code];
+          }
+        });
+        if (changed) storageHelper.setItem('transactions', JSON.stringify(out));
+        return changed ? out : prev;
+      });
+      setFundDailyEarnings((prev) => {
+        if (!isPlainObject(prev)) return prev;
+        let changed = false;
+        const next = { ...prev };
+        removedIds.forEach((rid) => {
+          if (rid in next) {
+            delete next[rid];
+            changed = true;
+          }
+        });
+        if (changed) storageHelper.setItem('fundDailyEarnings', JSON.stringify(next));
+        return changed ? next : prev;
+      });
     }
   };
 
@@ -3648,10 +3836,52 @@ export default function HomePage() {
         const saved = JSON.parse(localStorage.getItem('funds') || '[]');
         if (Array.isArray(saved) && saved.length) {
           const deduped = dedupeByCode(saved);
-          setFunds(deduped);
-          storageHelper.setItem('funds', JSON.stringify(deduped));
-          const codes = Array.from(new Set(deduped.map((f) => f.code)));
+          const fundCodeSet = new Set(deduped.map((f) => f?.code).filter(Boolean));
+          let storedTagRows = [];
+          try {
+            storedTagRows = JSON.parse(localStorage.getItem('tags') || '[]');
+          } catch { /* empty */ }
+          if (!Array.isArray(storedTagRows)) storedTagRows = [];
+          const mergedTags = mergeLegacyInlineTagsIntoRecords(deduped, storedTagRows, () => uuidv4());
+          const normalizedTags = mergedTags
+            .map((r) => {
+              const codes = getFundCodesFromTagRecord(r).filter((c) => fundCodeSet.has(c));
+              return {
+                id: String(r.id || '').trim() || uuidv4(),
+                name: String(r.name || '').trim(),
+                theme: String(r.theme || '').trim() || DEFAULT_FUND_TAG_THEME,
+                fundCodes: codes.sort(),
+              };
+            })
+            .filter((r) => r.name);
+          const cleanedFunds = deduped.map(stripLegacyTagsFromFundObject);
+          setFundTagRecords(normalizedTags);
+          storageHelper.setItem('tags', JSON.stringify(normalizedTags));
+          setFunds(cleanedFunds);
+          storageHelper.setItem('funds', JSON.stringify(cleanedFunds));
+          const codes = Array.from(new Set(cleanedFunds.map((f) => f.code)));
           if (codes.length && shouldRefreshFromLocal) refreshAll(codes);
+        } else {
+          try {
+            const t = JSON.parse(localStorage.getItem('tags') || '[]');
+            const arr = Array.isArray(t) ? t : [];
+            const normalized = arr
+              .map((r) => {
+                const codes = getFundCodesFromTagRecord(r);
+                const name = String(r.name || '').trim();
+                if (!name) return null;
+                return {
+                  id: String(r.id || '').trim() || uuidv4(),
+                  name,
+                  theme: String(r.theme || '').trim() || DEFAULT_FUND_TAG_THEME,
+                  fundCodes: codes.sort(),
+                };
+              })
+              .filter(Boolean);
+            setFundTagRecords(normalized);
+          } catch {
+            setFundTagRecords([]);
+          }
         }
       const savedMs = parseInt(localStorage.getItem('refreshMs') || '30000', 10);
       if (Number.isFinite(savedMs) && savedMs >= 5000) {
@@ -3870,6 +4100,8 @@ export default function HomePage() {
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'user_configs', filter: `user_id=eq.${user.id}` }, async (payload) => {
         const incoming = payload?.new?.data;
         if (!isPlainObject(incoming)) return;
+        const incomingDeviceId = incoming?._syncMeta?.deviceId ? String(incoming._syncMeta.deviceId) : '';
+        if (incomingDeviceId && deviceIdRef.current && incomingDeviceId === deviceIdRef.current) return;
         const incomingComparable = getComparablePayload(incoming);
         if (!incomingComparable || incomingComparable === lastSyncedRef.current) return;
         await applyCloudConfig(incoming, payload.new.updated_at);
@@ -3877,6 +4109,8 @@ export default function HomePage() {
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'user_configs', filter: `user_id=eq.${user.id}` }, async (payload) => {
         const incoming = payload?.new?.data;
         if (!isPlainObject(incoming)) return;
+        const incomingDeviceId = incoming?._syncMeta?.deviceId ? String(incoming._syncMeta.deviceId) : '';
+        if (incomingDeviceId && deviceIdRef.current && incomingDeviceId === deviceIdRef.current) return;
         const incomingComparable = getComparablePayload(incoming);
         if (!incomingComparable || incomingComparable === lastSyncedRef.current) return;
         await applyCloudConfig(incoming, payload.new.updated_at);
@@ -4975,6 +5209,18 @@ export default function HomePage() {
       storageHelper.setItem('dcaPlans', JSON.stringify(nextScoped));
       return nextScoped;
     });
+
+    setFundTagRecords((prev) => {
+      const next = prev
+        .map((r) => {
+          const codes = getFundCodesFromTagRecord(r).filter((c) => c !== removeCode);
+          return sanitizeTagRowForStorage({ ...r, fundCodes: codes });
+        })
+        .filter(Boolean);
+      if (serializeTagRecordsForCompare(prev) === serializeTagRecordsForCompare(next)) return prev;
+      storageHelper.setItem('tags', JSON.stringify(next));
+      return next;
+    });
   };
 
   /** 批量从「全部」逻辑删除多支基金（单次合并更新） */
@@ -5192,6 +5438,18 @@ export default function HomePage() {
       if (!changed) return prev;
       storageHelper.setItem('dcaPlans', JSON.stringify(nextScoped));
       return nextScoped;
+    });
+
+    setFundTagRecords((prev) => {
+      const next = prev
+        .map((r) => {
+          const codes = getFundCodesFromTagRecord(r).filter((c) => !set.has(c));
+          return sanitizeTagRowForStorage({ ...r, fundCodes: codes });
+        })
+        .filter(Boolean);
+      if (serializeTagRecordsForCompare(prev) === serializeTagRecordsForCompare(next)) return prev;
+      storageHelper.setItem('tags', JSON.stringify(next));
+      return next;
     });
   };
 
@@ -5503,8 +5761,22 @@ export default function HomePage() {
           });
       });
 
+    const tagRows = Array.isArray(payload.tags) ? payload.tags : [];
+    const tagsSig = tagRows
+      .map((r) => {
+        const codes = getFundCodesFromTagRecord(r)
+          .map((c) => normalizeCode(c))
+          .filter(Boolean)
+          .sort()
+          .join(',');
+        return `${codes}|${String(r?.id ?? '')}|${String(r?.name ?? '')}|${String(r?.theme ?? '')}`;
+      })
+      .sort()
+      .join('\n');
+
     return JSON.stringify({
       funds: uniqueFundCodes,
+      tagsSig,
       favorites,
       groups,
       collapsedCodes,
@@ -5571,9 +5843,19 @@ export default function HomePage() {
           all.fundDailyEarnings = {};
         }
       }
+      if (!keys || keys.has('tags')) {
+        try {
+          all.tags = JSON.parse(localStorage.getItem('tags') || '[]');
+        } catch {
+          all.tags = [];
+        }
+        if (!Array.isArray(all.tags)) all.tags = [];
+      }
+      // fundTagLists 已废弃：基金-标签归属仅由 tags.fundCodes 推导
 
       // 如果是全量收集（keys 为 null），进行完整的数据清洗和验证逻辑
       if (!keys) {
+        all.funds = Array.isArray(all.funds) ? all.funds.map(stripLegacyTagsFromFundObject) : [];
         const fundCodes = new Set(
           Array.isArray(all.funds)
             ? all.funds.map((f) => f?.code).filter(Boolean)
@@ -5704,8 +5986,28 @@ export default function HomePage() {
           return acc;
         }, {});
 
+        const cleanedTags = Array.isArray(all.tags)
+          ? all.tags
+            .map((r) => {
+              const codes = getFundCodesFromTagRecord(r).filter((c) => fundCodes.has(c));
+              const name = String(r?.name ?? '').trim();
+              if (!name) return null;
+              return sanitizeTagRowForStorage({
+                ...r,
+                id: String(r?.id ?? '').trim() || uuidv4(),
+                name,
+                theme: String(r?.theme ?? '').trim() || DEFAULT_FUND_TAG_THEME,
+                fundCodes: codes,
+              });
+            })
+            .filter(Boolean)
+          : [];
+
+        // fundTagLists 已废弃：不再清洗/返回该字段
+
         return {
           funds: all.funds,
+          tags: cleanedTags,
           favorites: cleanedFavorites,
           groups: cleanedGroups,
           collapsedCodes: cleanedCollapsed,
@@ -5729,6 +6031,7 @@ export default function HomePage() {
       if (keys) return {};
       return {
         funds: [],
+        tags: [],
         favorites: [],
         groups: [],
         collapsedCodes: [],
@@ -5746,6 +6049,29 @@ export default function HomePage() {
     }
   };
 
+  const mergeValuationFieldsByGztime = (localFund, cloudFund) => {
+    if (!isPlainObject(cloudFund)) return cloudFund;
+    if (!isPlainObject(localFund)) return cloudFund;
+
+    const localGzRaw = localFund.gztime;
+    const cloudGzRaw = cloudFund.gztime;
+
+    if (!isString(localGzRaw) || !isString(cloudGzRaw)) return cloudFund;
+
+    const localGz = toTz(localGzRaw);
+    const cloudGz = toTz(cloudGzRaw);
+    if (!localGz?.isValid?.() || !cloudGz?.isValid?.()) return cloudFund;
+
+    if (!localGz.isAfter(cloudGz)) return cloudFund;
+
+    const patch = {};
+    if (!isNil(localFund.gsz)) patch.gsz = localFund.gsz;
+    if (!isNil(localFund.gszzl)) patch.gszzl = localFund.gszzl;
+    if (!isNil(localFund.gztime)) patch.gztime = localFund.gztime;
+
+    return { ...cloudFund, ...patch };
+  };
+
   const applyCloudConfig = async (cloudData, cloudUpdatedAt) => {
     if (!isPlainObject(cloudData)) return;
     skipSyncRef.current = true;
@@ -5753,17 +6079,83 @@ export default function HomePage() {
       if (cloudUpdatedAt) {
         storageHelper.setItem('localUpdatedAt', cloudUpdatedAt);
       }
-      const nextFunds = Array.isArray(cloudData.funds) ? dedupeByCode(cloudData.funds) : [];
+      let localFundsForMerge = [];
+      try {
+        const parsed = JSON.parse(localStorage.getItem('funds') || '[]');
+        localFundsForMerge = Array.isArray(parsed) ? parsed : [];
+      } catch { }
+      const localFundByCode = new Map(
+        localFundsForMerge
+          .map(stripLegacyTagsFromFundObject)
+          .filter((f) => f && f.code != null)
+          .map((f) => [String(f.code), f])
+      );
+
+      const cloudFunds = Array.isArray(cloudData.funds)
+        ? dedupeByCode(cloudData.funds.map(stripLegacyTagsFromFundObject))
+        : [];
+      const nextFunds = cloudFunds.map((cf) => mergeValuationFieldsByGztime(localFundByCode.get(String(cf?.code)), cf));
       setFunds(nextFunds);
       storageHelper.setItem('funds', JSON.stringify(nextFunds));
       const nextFundCodes = new Set(nextFunds.map((f) => f.code));
+
+      if (hasOwn(cloudData, 'tags')) {
+        const cleanedTagRows = (Array.isArray(cloudData.tags) ? cloudData.tags : [])
+          .map((r) => {
+            const codes = getFundCodesFromTagRecord(r).filter((c) => nextFundCodes.has(c));
+            const name = String(r?.name ?? '').trim();
+            if (!name) return null;
+            return sanitizeTagRowForStorage({
+              ...r,
+              id: String(r?.id ?? '').trim() || uuidv4(),
+              name,
+              theme: String(r?.theme ?? '').trim() || DEFAULT_FUND_TAG_THEME,
+              fundCodes: codes,
+            });
+          })
+          .filter(Boolean);
+        setFundTagRecords(cleanedTagRows);
+        storageHelper.setItem('tags', JSON.stringify(cleanedTagRows));
+      } else {
+        try {
+          const localTags = JSON.parse(localStorage.getItem('tags') || '[]');
+          const arr = Array.isArray(localTags) ? localTags : [];
+          const normalized = arr
+            .map((r) => {
+              const codes = getFundCodesFromTagRecord(r).filter((c) => nextFundCodes.has(c));
+              return sanitizeTagRowForStorage({
+                ...r,
+                id: String(r.id || '').trim() || uuidv4(),
+                name: String(r.name || '').trim(),
+                theme: String(r.theme || '').trim() || DEFAULT_FUND_TAG_THEME,
+                fundCodes: codes,
+              });
+            })
+            .filter(Boolean);
+          setFundTagRecords(normalized);
+        } catch {
+          setFundTagRecords([]);
+        }
+      }
+
+      // fundTagLists 已废弃：基金-标签归属仅由 tags.fundCodes 推导
 
       // favorites 必须是字符串 code，且必须存在于 funds 中
       const nextFavorites = cleanCodeArray(cloudData.favorites, nextFundCodes);
       setFavorites(new Set(nextFavorites));
       storageHelper.setItem('favorites', JSON.stringify(nextFavorites));
 
-      const nextGroups = Array.isArray(cloudData.groups) ? cloudData.groups : [];
+      const nextGroups = Array.isArray(cloudData.groups)
+        ? cloudData.groups
+            .map((g) => ({
+              ...g,
+              id: String(g?.id ?? '').trim() || uuidv4(),
+              name: String(g?.name ?? '').trim(),
+              codes: cleanCodeArray(g?.codes, nextFundCodes),
+            }))
+            // 保留“空分组”（codes 允许为空）；仅丢弃无名称分组，避免云端应用时误删用户刚新建的分组
+            .filter((g) => g.name.length > 0)
+        : [];
       setGroups(nextGroups);
       storageHelper.setItem('groups', JSON.stringify(nextGroups));
 
@@ -5962,8 +6354,33 @@ export default function HomePage() {
     }
     try {
       setIsSyncing(true);
-      const dataToSync = payload || collectLocalPayload(); // Fallback to full sync if no payload
+      const baseData = payload || collectLocalPayload(); // Fallback to full sync if no payload
       const now = nowInTz().toISOString();
+      let deviceId = deviceIdRef.current || '';
+      if (!deviceId) {
+        try {
+          const key = 'rtfDeviceId';
+          deviceId = window.localStorage.getItem(key) || '';
+          if (!deviceId) {
+            deviceId = uuidv4();
+            window.localStorage.setItem(key, deviceId);
+          }
+          deviceIdRef.current = deviceId;
+        } catch {
+          deviceId = uuidv4();
+          deviceIdRef.current = deviceId;
+        }
+      }
+      const dataToSync = isPlainObject(baseData)
+        ? {
+            ...baseData,
+            _syncMeta: {
+              ...(isPlainObject(baseData._syncMeta) ? baseData._syncMeta : {}),
+              deviceId,
+              at: now,
+            }
+          }
+        : { _syncMeta: { deviceId, at: now } };
 
       if (isPartial) {
         // 增量更新：使用 RPC 调用
@@ -6026,6 +6443,7 @@ export default function HomePage() {
     try {
       const payload = {
         funds: JSON.parse(localStorage.getItem('funds') || '[]'),
+        tags: JSON.parse(localStorage.getItem('tags') || '[]'),
         favorites: JSON.parse(localStorage.getItem('favorites') || '[]'),
         groups: JSON.parse(localStorage.getItem('groups') || '[]'),
         collapsedCodes: JSON.parse(localStorage.getItem('collapsedCodes') || '[]'),
@@ -6102,7 +6520,7 @@ export default function HomePage() {
         let appendedCodes = [];
 
         if (Array.isArray(data.funds)) {
-          const incomingFunds = dedupeByCode(data.funds);
+          const incomingFunds = dedupeByCode(data.funds.map(stripLegacyTagsFromFundObject));
           const existingCodes = new Set(currentFunds.map(f => f.code));
           const newItems = incomingFunds.filter(f => f && f.code && !existingCodes.has(f.code));
           appendedCodes = newItems.map(f => f.code);
@@ -6117,6 +6535,38 @@ export default function HomePage() {
           setFavorites(new Set(mergedFav));
           storageHelper.setItem('favorites', JSON.stringify(mergedFav));
         }
+
+        if (Array.isArray(data.tags)) {
+          const currentTags = JSON.parse(localStorage.getItem('tags') || '[]');
+          const fundCodeSet = new Set(mergedFunds.map((f) => f?.code).filter(Boolean));
+          const byId = new Map((Array.isArray(currentTags) ? currentTags : []).map((r) => [String(r.id), r]));
+          for (const r of data.tags) {
+            if (!r || typeof r !== 'object') continue;
+            const codes = getFundCodesFromTagRecord(r).filter((c) => fundCodeSet.has(c));
+            const name = String(r.name ?? '').trim();
+            if (!name) continue;
+            const id = String(r.id ?? '').trim() || uuidv4();
+            const existing = byId.get(id);
+            const mergedCodes = existing
+              ? [...new Set([...getFundCodesFromTagRecord(existing), ...codes])].sort()
+              : codes.sort();
+            const row = sanitizeTagRowForStorage({
+              id,
+              name,
+              theme: String(r.theme ?? '').trim() || DEFAULT_FUND_TAG_THEME,
+              fundCodes: mergedCodes,
+            });
+            if (row) byId.set(id, row);
+          }
+          const mergedTags = Array.from(byId.values())
+            .map(sanitizeTagRowForStorage)
+            .filter(Boolean)
+            .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+          setFundTagRecords(mergedTags);
+          storageHelper.setItem('tags', JSON.stringify(mergedTags));
+        }
+
+        // fundTagLists 已废弃：导入时无需处理该字段
 
         if (Array.isArray(data.groups)) {
           // 合并分组：如果 ID 相同则合并 codes，否则添加新分组
@@ -6333,7 +6783,8 @@ export default function HomePage() {
       settingsOpen ||
       sortSettingOpen ||
       mobileFundDrawerOpen ||
-      mobileTableSettingModalOpen,
+      mobileTableSettingModalOpen ||
+      fundTagsEdit.open,
     [
       portfolioEarningsOpen,
       feedbackOpen,
@@ -6364,6 +6815,7 @@ export default function HomePage() {
       sortSettingOpen,
       mobileFundDrawerOpen,
       mobileTableSettingModalOpen,
+      fundTagsEdit.open,
     ]
   );
 
@@ -6555,6 +7007,8 @@ export default function HomePage() {
       masked: maskAmounts,
       layoutMode: 'drawer',
       isHoldingLinked: !!row?.isHoldingLinked,
+      fundTags: row?.fundTags || [],
+      onFundTagsClick: openFundTagsEdit,
     };
   }, [
     todayStr,
@@ -6792,9 +7246,9 @@ export default function HomePage() {
           {isMobile && (
             <button
               className="icon-button mobile-search-btn"
-              aria-label="搜索基金"
+              aria-label="筛选基金"
               onClick={handleMobileSearchClick}
-              title="搜索"
+              title="筛选"
             >
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
                 <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2" />
@@ -7343,6 +7797,7 @@ export default function HomePage() {
                                 blockDialogClose={!!fundDeleteConfirm || !!fundDeleteBulkConfirm}
                                 masked={maskAmounts}
                                 getFundCardProps={getFundCardPropsForRow}
+                                onFundTagsClick={openFundTagsEdit}
                               />
                             </div>
                           </div>
@@ -7372,6 +7827,7 @@ export default function HomePage() {
                         onMobileSettingModalOpenChange={handleMobileSettingModalOpenChange}
                         getFundCardProps={getFundCardPropsForRow}
                         masked={maskAmounts}
+                        onFundTagsClick={openFundTagsEdit}
                       />
                     )}
                     <AnimatePresence mode="popLayout">
@@ -7418,6 +7874,8 @@ export default function HomePage() {
                               onToggleTrendCollapse={toggleTrendCollapse}
                               onToggleEarningsCollapse={toggleEarningsCollapse}
                               masked={maskAmounts}
+                              fundTags={Array.isArray(fundTagListsByCode[f.code]) ? fundTagListsByCode[f.code] : []}
+                              onFundTagsClick={openFundTagsEdit}
                             />
                         </motion.div>
                       ))}
@@ -7698,6 +8156,8 @@ export default function HomePage() {
             allFunds={funds}
             currentGroupCodes={groups.find(g => g.id === currentTab)?.codes || []}
             holdings={holdingsForTabWithLinked}
+            fundTagListsByCode={fundTagListsByCode}
+            fundTagRecords={fundTagRecords}
             onClose={() => setAddFundToGroupOpen(false)}
             onAdd={handleAddFundsToGroup}
           />
@@ -7748,6 +8208,25 @@ export default function HomePage() {
             fund={dcaModal.fund}
             plan={dcaPlansForTab[dcaModal.fund?.code]}
             onClose={() => setDcaModal({ open: false, fund: null })}
+            onReset={(fundCode) => {
+              const code = fundCode || dcaModal.fund?.code;
+              if (!code) return;
+              const scope = activeGroupId || DCA_SCOPE_GLOBAL;
+              setDcaPlans((prev) => {
+                const scoped = migrateDcaPlansToScoped(prev);
+                const bucket = isPlainObject(scoped[scope]) ? scoped[scope] : null;
+                if (!bucket || !Object.prototype.hasOwnProperty.call(bucket, code)) return prev;
+                const nextBucket = { ...bucket };
+                delete nextBucket[code];
+                const next = { ...scoped };
+                if (Object.keys(nextBucket).length === 0) delete next[scope];
+                else next[scope] = nextBucket;
+                storageHelper.setItem('dcaPlans', JSON.stringify(next));
+                return next;
+              });
+              setDcaModal({ open: false, fund: null });
+              showToast('已重置定投数据', 'success');
+            }}
             onConfirm={(config) => {
               const code = config?.fundCode || dcaModal.fund?.code;
               if (!code) {
@@ -7841,6 +8320,28 @@ export default function HomePage() {
               setHoldingModal({ open: false, fund: null });
               setTradeModal({ open: true, fund: f, type: 'buy' });
             }}
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {fundTagsEdit.open && (
+          <FundTagsEditDialog
+            open={fundTagsEdit.open}
+            onOpenChange={(open) => setFundTagsEdit((s) => ({ ...s, open }))}
+            isMobile={isMobile}
+            fundCode={fundTagsEdit.code ?? undefined}
+            fundName={fundTagsEdit.name}
+            tags={fundTagsEdit.tags}
+            onSave={handleSaveFundTags}
+            recommendedTagItems={fundTagRecords.map((r) => ({
+              id: String(r?.id ?? '').trim(),
+              name: String(r?.name ?? '').trim(),
+              theme: String(r?.theme ?? '').trim() || DEFAULT_FUND_TAG_THEME,
+            })).filter((x) => x.name)}
+            onAddPoolTag={handleAddPoolTag}
+            onDeleteGlobalTag={handleDeleteGlobalTag}
+            getTagUsageLabels={getTagUsageLabels}
           />
         )}
       </AnimatePresence>
@@ -7971,34 +8472,40 @@ export default function HomePage() {
         onChange={handleFilesUpload}
       />
 
-      {settingsOpen && (
-        <SettingsModal
-          onClose={() => setSettingsOpen(false)}
-          tempSeconds={tempSeconds}
-          setTempSeconds={setTempSeconds}
-          saveSettings={saveSettings}
-          exportLocalData={exportLocalData}
-          importFileRef={importFileRef}
-          handleImportFileChange={handleImportFileChange}
-          importMsg={importMsg}
-          isMobile={isMobile}
-          containerWidth={containerWidth}
-          setContainerWidth={setContainerWidth}
-          onResetContainerWidth={handleResetContainerWidth}
-          showMarketIndexPc={showMarketIndexPc}
-          showMarketIndexMobile={showMarketIndexMobile}
-          showGroupFundSearchPc={showGroupFundSearchPc}
-          showGroupFundSearchMobile={showGroupFundSearchMobile}
-        />
-      )}
+      <AnimatePresence>
+        {settingsOpen && (
+          <SettingsModal
+            onClose={() => setSettingsOpen(false)}
+            tempSeconds={tempSeconds}
+            setTempSeconds={setTempSeconds}
+            saveSettings={saveSettings}
+            exportLocalData={exportLocalData}
+            importFileRef={importFileRef}
+            handleImportFileChange={handleImportFileChange}
+            importMsg={importMsg}
+            isMobile={isMobile}
+            containerWidth={containerWidth}
+            setContainerWidth={setContainerWidth}
+            onResetContainerWidth={handleResetContainerWidth}
+            showMarketIndexPc={showMarketIndexPc}
+            showMarketIndexMobile={showMarketIndexMobile}
+            showGroupFundSearchPc={showGroupFundSearchPc}
+            showGroupFundSearchMobile={showGroupFundSearchMobile}
+          />
+        )}
+      </AnimatePresence>
 
       {/* 更新提示弹窗 */}
-      <UpdatePromptModal
-        open={updateModalOpen}
-        updateContent={updateContent}
-        onClose={() => setUpdateModalOpen(false)}
-        onRefresh={() => window.location.reload()}
-      />
+      <AnimatePresence>
+        {updateModalOpen && (
+          <UpdatePromptModal
+            open={updateModalOpen}
+            updateContent={updateContent}
+            onClose={() => setUpdateModalOpen(false)}
+            onRefresh={() => window.location.reload()}
+          />
+        )}
+      </AnimatePresence>
 
       <AnimatePresence>
         {isScanning && (
@@ -8013,86 +8520,50 @@ export default function HomePage() {
       </AnimatePresence>
 
       {/* 登录模态框 */}
-      {loginModalOpen && (
-        <LoginModal
-          onClose={() => {
-            setLoginModalOpen(false);
-            setLoginError('');
-            setLoginSuccess('');
-            setLoginEmail('');
-            setLoginOtp('');
-            setLoginLoading(false);
-          }}
-          isMobile={isMobile}
-          loginEmail={loginEmail}
-          setLoginEmail={setLoginEmail}
-          loginOtp={loginOtp}
-          setLoginOtp={setLoginOtp}
-          loginLoading={loginLoading}
-          loginError={loginError}
-          loginSuccess={loginSuccess}
-          handleSendOtp={handleSendOtp}
-          handleVerifyEmailOtp={handleVerifyEmailOtp}
-          handleGithubLogin={isSupabaseConfigured && process.env.NEXT_PUBLIC_IS_GITHUB_LOGIN === 'true' ? handleGithubLogin : undefined}
-        />
-      )}
-
-      {/* 排序个性化设置弹框 */}
-      <SortSettingModal
-        open={sortSettingOpen}
-        onClose={() => setSortSettingOpen(false)}
-        isMobile={isMobile}
-        rules={sortRules}
-        onChangeRules={setSortRules}
-        sortDisplayMode={sortDisplayMode}
-        onChangeSortDisplayMode={setSortDisplayMode}
-        onResetRules={() => setSortRules(DEFAULT_SORT_RULES)}
-      />
-
-      {/* 全局轻提示 Toast */}
       <AnimatePresence>
-        {toast.show && (
-          <motion.div
-            initial={{ opacity: 0, y: -20, x: '-50%' }}
-            animate={{ opacity: 1, y: 0, x: '-50%' }}
-            exit={{ opacity: 0, y: -20, x: '-50%' }}
-            style={{
-              position: 'fixed',
-              top: 24,
-              left: '50%',
-              zIndex: 9999,
-              padding: '10px 20px',
-              background: toast.type === 'error' ? 'rgba(239, 68, 68, 0.9)' :
-                          toast.type === 'success' ? 'rgba(34, 197, 94, 0.9)' :
-                          'rgba(30, 41, 59, 0.9)',
-              color: '#fff',
-              borderRadius: '8px',
-              backdropFilter: 'blur(8px)',
-              boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
-              fontSize: '14px',
-              fontWeight: 500,
-              display: 'flex',
-              alignItems: 'center',
-              gap: 8,
-              maxWidth: '90vw',
-              whiteSpace: 'nowrap'
+        {loginModalOpen && (
+          <LoginModal
+            onClose={() => {
+              setLoginModalOpen(false);
+              setLoginError('');
+              setLoginSuccess('');
+              setLoginEmail('');
+              setLoginOtp('');
+              setLoginLoading(false);
             }}
-          >
-            {toast.type === 'error' && (
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2"/>
-                <path d="M12 8v4M12 16h.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
-              </svg>
-            )}
-            {toast.type === 'success' && (
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-              </svg>
-            )}
-            {toast.message}
-          </motion.div>
+            isMobile={isMobile}
+            loginEmail={loginEmail}
+            setLoginEmail={setLoginEmail}
+            loginOtp={loginOtp}
+            setLoginOtp={setLoginOtp}
+            loginLoading={loginLoading}
+            loginError={loginError}
+            loginSuccess={loginSuccess}
+            handleSendOtp={handleSendOtp}
+            handleVerifyEmailOtp={handleVerifyEmailOtp}
+            handleGithubLogin={isSupabaseConfigured && process.env.NEXT_PUBLIC_IS_GITHUB_LOGIN === 'true' ? handleGithubLogin : undefined}
+          />
         )}
       </AnimatePresence>
+
+      {/* 排序个性化设置弹框 */}
+      <AnimatePresence>
+        {sortSettingOpen && (
+          <SortSettingModal
+            open={sortSettingOpen}
+            onClose={() => setSortSettingOpen(false)}
+            isMobile={isMobile}
+            rules={sortRules}
+            onChangeRules={setSortRules}
+            sortDisplayMode={sortDisplayMode}
+            onChangeSortDisplayMode={setSortDisplayMode}
+            onResetRules={() => setSortRules(DEFAULT_SORT_RULES)}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* 全局轻提示 Toast */}
+      <GlobalToast toast={toast} />
     </div>
   );
 }
